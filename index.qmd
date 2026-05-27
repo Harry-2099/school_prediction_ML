@@ -2,4 +2,7 @@
 title: "Harry Sohal"
 subtitle: "Data Science & Machine Learning"
 ---
+
+# Welcome
+
 - [View My Project](Stat_learning_final_paper.html)
