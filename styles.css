@@ -1,0 +1,21 @@
+/* light touch — Quarto themes already look good, this just refines a few things */
+
+.navbar-title {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+/* tighten the listing cards a touch */
+.quarto-listing .card {
+  border-radius: 10px;
+}
+
+/* make tables from your report (similarity lookups, etc.) sit cleanly */
+table {
+  font-size: 0.92rem;
+}
+
+/* code fold buttons less obtrusive */
+.code-fold {
+  border-radius: 6px;
+}

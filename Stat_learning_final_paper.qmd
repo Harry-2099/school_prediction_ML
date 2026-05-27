@@ -1,0 +1,1549 @@
+---
+title: "School Proficiency Prediction"
+format: 
+    html:
+        code-fold: true
+author: "Harry Sohal"
+engine: jupyter
+jupyter: torch_env
+---
+```{python}
+#| include: false
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import yaml
+import cloudpickle
+import joblib
+
+# ALT FEATURES
+X_train_alt = pd.read_parquet("X_train_alt.parquet")
+X_val_alt   = pd.read_parquet("X_val_alt.parquet")
+X_test_alt  = pd.read_parquet("X_test_alt.parquet")
+
+# FULL FEATURES
+X_train = pd.read_parquet("X_train.parquet")
+X_val   = pd.read_parquet("X_val.parquet")
+X_test  = pd.read_parquet("X_test.parquet")
+
+# TARGETS
+Y_train = pd.read_parquet("Y_train.parquet").squeeze()
+Y_val   = pd.read_parquet("Y_val.parquet").squeeze()
+Y_test  = pd.read_parquet("Y_test.parquet").squeeze()
+
+# quick checks
+print("X_train:", X_train.shape)
+print("X_val:", X_val.shape)
+print("X_test:", X_test.shape)
+
+print("X_train_alt:", X_train_alt.shape)
+print("X_val_alt:", X_val_alt.shape)
+print("X_test_alt:", X_test_alt.shape)
+
+print("Y_train:", Y_train.shape)
+print("Y_val:", Y_val.shape)
+print("Y_test:", Y_test.shape)
+
+full_pasted_cats = [c for c in X_train.columns if X_train[c].dtype not in ["float","int64"] and  c != "ASSESSMENT_ID"] 
+
+for c in full_pasted_cats:
+    X_train[c] = X_train[c].astype("category")
+    X_test[c] = X_test[c].astype("category")
+
+    X_test[c] = pd.Categorical(
+        X_test[c],
+        categories=X_train[c].cat.categories
+    )
+
+X_test.dtypes[full_pasted_cats]
+```
+# Introduction
+Standardized test results in New York State are reported as the percentage of students scoring proficient on a given assessment, broken down by school, grade-level exam, and demographic subgroup. This competition tasked us with predicting that proficiency percentage from school-level characteristics, demographic composition, and assessment metadata. On its surface this is a routine regression problem, but several features of the dataset make this a more complex challenge.
+First, the target is bounded and bimodal. Rather than a smooth distribution, proficiency rates pile up at the extremes: a non-trivial share of rows report exactly 0% or exactly 100% proficient. A standard regression model trained on squared error is pulled toward the conditional mean and systematically struggles to commit to these endpoints, smoothing its predictions toward the middle where it is penalized least. Second, the data contained features that had extremely high cardinality, for example the school columns contained over 4000 unique categories. Since these features carry high predictive signal dropping them was out of the question. In order to sufficiently solve the problem of predicting school performance, we need a model that is able to address the above concerns. 
+
+### *The Approach: Trees & Networks*
+In the search of finding an appropriate model, we often start with the simplest first and then increase the complexity. Starting with a simpler linear Regression methods like Ridge and Elastic Net I found this was perhaps not the correct model for this problem. Moving to a more statistically appropriate approach in Beta Regression, I found this was also not enough juice for this data. Ultimately we needed something that could handle non-linearity and high cardinal categorical features. Two approaches showed high promise on paper and were ultimately included in the final modeling pipeline. The first being Light Gradient Boosting Model (LGBM). This model uses a gradient boosting trees approach with a couple of main differences that make this model especially good for this data. Firstly, unlike its predecessor XG-Boost, it grows leaf-wise instead of level wise allowing it to be a more flexible model but more prone to over fitting. The second biggest advantage that this model has is its native categorical handling. Light-GBM splits a categorical feature by first sorting its categories by their accumulated gradient statistic, $\dfrac{\sum_{i \in c} g_i}{\sum_{i \in c} h_i}$, and then applying a result from Fisher (1958). Once sorted, the categories are treated as if numeric and scanned for the threshold that maximizes split gain. Fisher's result guarantees this is exact: the optimal partition is always *consecutive* in the sorted order, so a high-ranked and a low-ranked category are never grouped together while a middle-ranked one is split off. This reduces an otherwise exponential search over category subsets to a single linear scan. LGBM's internal handling proved to be very strong, and on these data set performed better than target encoding these features. This might be expected with the somewhat complex methodology that is being used under the hood. If we take a step back and take a look at how LGBM is handling the high cardinality, we can see that it is essentially computing some number for each category based on loss reduction as representation for that categorical value to solve the overall problem. This leads us naturally to the next idea, which ends up being profoundly similar when using the above framing; Embedding. Embedding, like LGBM's approach to categorical values, does a numeric representation with a key difference. Instead of representing with a scalar value, we use a vector that is learned and refined through gradient descent. As we'll see shortly this method learns vectors such that categories that are similar will point in the same direction, and those that are very different will point in orthogonal directions in the embedding space. To apply this methodology I will implement it inside a neural network. The embedding approach proves to be very useful for this task for several reasons including predictive performance, as well as making novel and interesting discoveries about the underlying data in a way that is not typical of non-interpretable neural networks.
+
+# Modeling
+### Implementation, What Worked, Learnings and Pitfalls
+#### *Light Gradient Boosting Model*
+The beauty of models like LGBM is that are extremely quick to implement, and despite all the complexity under the hood it essentially comes down to `import machine machine.learn(X_train,Y_train)`. However, something that is non-trivial is the tuning of these models. Especially with a model like LGBM, there are several hyperparameters that are mandatory to tune because of its extreme flexibility. One of the best ways to do this on any dataset of moderate size is to use a Bayesian Optimization approach to tune the hyperparamters, implemented through Optuna. The particular Optuna loop that I settled on was a 6 fold cross-validation within, with Optuna optimizing for the parameters that perform the best the average across the CV fold. The idea being that Optuna will pick the hyperparameters that *generalize* the best. This model ultimately ended with an MSE of 82 on the internal test set and gave the following results.
+```{python}
+import pandas as pd
+
+test_pred_df = pd.read_parquet("test_predictions.parquet")
+test_pred_df["residual"] = test_pred_df["y_true"] - test_pred_df["y_pred"]
+import seaborn as sns
+import matplotlib.pyplot as plt
+sns.histplot(test_pred_df["y_true"], color="red", alpha=0.5, label="Actual")
+sns.histplot(test_pred_df["y_pred"], color="green", alpha=0.5, label="Predicted")
+plt.legend()
+plt.title("Actual vs Predicted (Test)")
+plt.show()
+
+plt.figure()
+plt.scatter(test_pred_df["y_pred"], test_pred_df["residual"], alpha=0.3)
+plt.axhline(0, color="red")
+plt.title("Residuals vs Predicted")
+plt.xlabel("Predicted")
+plt.ylabel("Residual")
+plt.show()
+```
+
+The above result shows the problem stated in the introduction. With a bounded response, that has masses at the end points, MSE loss will struggle to capture this distribution. After spending a large amount of time attempting to improve this model trying to get it below the 81-82 mark on the internal test set was difficult. Using a different boosting method DART, or drop at random trees made a difference by reducing the error to 79, but I felt that I had reached the limit of what LGBM was able to do on this dataset.
+
+#### *Neural Network with Embedding*
+```{python #prep_NN}
+#| include: false
+print("CHECK SHAPES BEFORE RUNNING")
+print("X_train:", X_train.shape)
+print("Y_train:", Y_train.shape)
+
+print("X_val:", X_val.shape)
+print("Y_val:", Y_val.shape)
+
+print("X_test:", X_test.shape)
+print("Y_test:", Y_test.shape)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+import copy
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)  
+# should print: cuda
+### mapping the variables for the embeddings
+# school_col = "cat__SCHOOL"
+# district_col = "cat__DISTRICT"
+# exam_col = "cat__ASSESSMENT_NAME"
+# subgroup_col = "cat__SUBGROUP_NAME"
+
+embed_cols = ["cat__SCHOOL","cat__DISTRICT","cat__ASSESSMENT_NAME",
+              "cat__SUBGROUP_NAME","cat__DISTRICT_TYPE"]
+#make the rest of the cats into dummies
+cat_cols = [
+    col for col in X_train.columns if col.startswith("cat")
+            and col not in embed_cols
+            ]
+print("Categorical columns:", cat_cols)
+
+# train
+X_train_cont = X_train.drop(columns=embed_cols).copy()
+print("Before dummies train shape:", X_train_cont.shape)
+
+X_train_cont = pd.get_dummies(X_train_cont, columns=cat_cols)
+print("After dummies train shape:", X_train_cont.shape)
+
+# test
+X_test_cont = X_test.drop(columns=embed_cols).copy()
+print("Before dummies test shape:", X_test_cont.shape)
+
+X_test_cont = pd.get_dummies(X_test_cont, columns=cat_cols)
+print("After dummies test shape:", X_test_cont.shape)
+
+X_val_cont = X_val.drop(columns=embed_cols).copy()
+print("Before dummies val shape:", X_val_cont.shape)
+
+X_val_cont = pd.get_dummies(X_val_cont, columns=cat_cols)
+print("After dummies val shape:", X_val_cont.shape)
+
+
+print("Train memory MB:", X_train_cont.memory_usage(deep=True).sum() / 1024**2)
+print("Test memory MB:", X_test_cont.memory_usage(deep=True).sum() / 1024**2)
+
+
+#check align
+X_val_cont = X_val_cont.reindex(columns=X_train_cont.columns, fill_value=0)
+X_test_cont = X_test_cont.reindex(columns=X_train_cont.columns, fill_value=0)
+
+print(X_train_cont.shape)
+print(X_val_cont.shape)
+print(X_test_cont.shape)
+
+print("Making Embededings for\n",embed_cols)
+
+def encode_embed_cols(cols, X_train, X_val, X_test):
+    """
+    For each column:
+    - build mapping from TRAIN
+    - apply to train/val/test
+    - return encoded versions + maps
+    """
+
+    encoded = {}
+    maps = {}
+
+    for col in cols:
+        # ensure string
+        train_raw = X_train[col].astype(str)
+        val_raw   = X_val[col].astype(str)
+        test_raw  = X_test[col].astype(str)
+
+        # create mapping (train only)
+        unique_vals = train_raw.dropna().unique()
+        id_map = {val: idx + 1 for idx, val in enumerate(unique_vals)}  # start at 1
+
+        # apply mapping
+        train_enc = train_raw.map(id_map).fillna(0).astype(int)
+        val_enc   = val_raw.map(id_map).fillna(0).astype(int)
+        test_enc  = test_raw.map(id_map).fillna(0).astype(int)
+
+        # store
+        encoded[col] = {
+            "train": train_enc,
+            "val": val_enc,
+            "test": test_enc
+        }
+
+        maps[col] = id_map
+
+    return encoded, maps
+#apply function
+encoded, maps = encode_embed_cols(embed_cols,X_train,X_val,X_test)
+#training embedding
+exam_train = encoded["cat__ASSESSMENT_NAME"]["train"]
+district_train = encoded["cat__DISTRICT"]["train"]
+school_train = encoded["cat__SCHOOL"]["train"]
+dis_type_train = encoded["cat__DISTRICT_TYPE"]["train"]
+subgroup_train = encoded["cat__SUBGROUP_NAME"]["train"]
+# county_train = encoded["cat__COUNTY"]["train"]
+# region_train = encoded["cat__REGION"]["train"]
+#val embeeddings
+exam_val = encoded["cat__ASSESSMENT_NAME"]["val"]
+district_val = encoded["cat__DISTRICT"]["val"]
+school_val = encoded["cat__SCHOOL"]["val"]
+dis_type_val = encoded["cat__DISTRICT_TYPE"]["val"]
+subgroup_val = encoded["cat__SUBGROUP_NAME"]["val"]
+# county_val = encoded["cat__COUNTY"]["val"]
+# region_val = encoded["cat__REGION"]["val"]
+#test embeddings
+exam_test = encoded["cat__ASSESSMENT_NAME"]["test"]
+district_test = encoded["cat__DISTRICT"]["test"]
+school_test = encoded["cat__SCHOOL"]["test"]
+dis_type_test = encoded["cat__DISTRICT_TYPE"]["test"]
+subgroup_test = encoded["cat__SUBGROUP_NAME"]["test"]
+# county_test = encoded["cat__COUNTY"]["test"]
+# region_test = encoded["cat__REGION"]["test"]
+
+# ensure dtypes
+
+
+# continuous features -> float32
+
+X_train_cont = X_train_cont.astype(np.float32)
+X_val_cont   = X_val_cont.astype(np.float32)
+X_test_cont  = X_test_cont.astype(np.float32)
+
+
+# targets -> float32 numpy
+
+y_train_np = Y_train.to_numpy(dtype=np.float32).reshape(-1, 1)
+y_val_np   = Y_val.to_numpy(dtype=np.float32).reshape(-1, 1)
+y_test_np  = Y_test.to_numpy(dtype=np.float32).reshape(-1, 1)
+
+
+# helper for encoded series -> torch long tensor
+
+def enc_to_tensor(encoded_dict, split, col):
+    arr = encoded_dict[col][split].to_numpy(dtype=np.int64, copy=False)
+    return torch.from_numpy(arr)
+
+
+# build embedding tensor dictionaries
+
+embed_train_t = {
+    col: enc_to_tensor(encoded, "train", col)
+    for col in embed_cols
+}
+
+embed_val_t = {
+    col: enc_to_tensor(encoded, "val", col)
+    for col in embed_cols
+}
+
+embed_test_t = {
+    col: enc_to_tensor(encoded, "test", col)
+    for col in embed_cols
+}
+
+
+# continuous tensors
+
+X_train_cont_t = torch.from_numpy(X_train_cont.to_numpy(dtype=np.float32, copy=False))
+X_val_cont_t   = torch.from_numpy(X_val_cont.to_numpy(dtype=np.float32, copy=False))
+X_test_cont_t  = torch.from_numpy(X_test_cont.to_numpy(dtype=np.float32, copy=False))
+
+
+# target tensors
+
+y_train_t = torch.from_numpy(y_train_np)
+y_val_t   = torch.from_numpy(y_val_np)
+y_test_t  = torch.from_numpy(y_test_np)
+
+
+# retrieve individual embedding tensors
+
+exam_train_t = embed_train_t["cat__ASSESSMENT_NAME"]
+exam_val_t   = embed_val_t["cat__ASSESSMENT_NAME"]
+exam_test_t  = embed_test_t["cat__ASSESSMENT_NAME"]
+
+district_train_t = embed_train_t["cat__DISTRICT"]
+district_val_t   = embed_val_t["cat__DISTRICT"]
+district_test_t  = embed_test_t["cat__DISTRICT"]
+
+school_train_t = embed_train_t["cat__SCHOOL"]
+school_val_t   = embed_val_t["cat__SCHOOL"]
+school_test_t  = embed_test_t["cat__SCHOOL"]
+
+dis_type_train_t = embed_train_t["cat__DISTRICT_TYPE"]
+dis_type_val_t   = embed_val_t["cat__DISTRICT_TYPE"]
+dis_type_test_t  = embed_test_t["cat__DISTRICT_TYPE"]
+
+subgroup_train_t = embed_train_t["cat__SUBGROUP_NAME"]
+subgroup_val_t   = embed_val_t["cat__SUBGROUP_NAME"]
+subgroup_test_t  = embed_test_t["cat__SUBGROUP_NAME"]
+
+# county_train_t = embed_train_t["cat__COUNTY"]
+# county_val_t   = embed_val_t["cat__COUNTY"]
+# county_test_t  = embed_test_t["cat__COUNTY"]
+
+# region_train_t = embed_train_t["cat__REGION"]
+# region_val_t   = embed_val_t["cat__REGION"]
+# region_test_t  = embed_test_t["cat__REGION"]
+
+# sanity checks
+
+print("Continuous tensors:")
+print("Train:", X_train_cont_t.shape, y_train_t.shape)
+print("Val:  ", X_val_cont_t.shape, y_val_t.shape)
+print("Test: ", X_test_cont_t.shape, y_test_t.shape)
+
+print("\nEmbedding tensors:")
+print("exam_train_t:", exam_train_t.shape, exam_train_t.dtype)
+print("district_train_t:", district_train_t.shape, district_train_t.dtype)
+print("school_train_t:", school_train_t.shape, school_train_t.dtype)
+print("dis_type_train_t:", dis_type_train_t.shape, dis_type_train_t.dtype)
+print("subgroup_train_t:", subgroup_train_t.shape, subgroup_train_t.dtype)
+# print("county_train_t:", county_train_t.shape, county_train_t.dtype)
+# print("region_train_t:",region_train_t.shape,region_train_t.dtype)
+
+batch_size = 2048
+print(f"USING bATCH SIZE {batch_size} for training data {len(X_train)}, Training Steps:{len(X_train)/batch_size}")
+
+
+train_ds = TensorDataset(
+    school_train_t,
+    district_train_t,
+    dis_type_train_t,
+    exam_train_t,
+    subgroup_train_t,
+    X_train_cont_t,
+    y_train_t
+)
+
+val_ds = TensorDataset(
+    school_val_t,
+    district_val_t,
+    dis_type_val_t,
+    exam_val_t,
+    subgroup_val_t,
+    X_val_cont_t,
+    y_val_t
+)
+
+test_ds = TensorDataset(
+    school_test_t,
+    district_test_t,
+    dis_type_test_t,
+    exam_test_t,
+    subgroup_test_t,
+    X_test_cont_t,
+    y_test_t
+)
+
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+######## X_train_alt ##########
+
+```
+
+With this next model, I hoped to go deeper into the data and capture interactions and relationships that LGBM and other tree-based models were missing. After setting up the data to use embeddings and building out the architecture, the model immediately showed promise, landing within striking range of the tree-based models. The common sentiment is that tree-based models tend to beat neural networks on tabular data, so this was a welcome surprise. The advantage (and disadvantage) of a neural network is that it is fully customizable: you design the model from the ground up, including how it trains. This is where the bulk of the effort went, finding the optimal design choices.
+
+#### *Architectural Choices*
+
+The first neural architecture, EmbedNet, established the core design that all later versions retained: separate learned embeddings for categorical features (school, district, district type, assessment, and subgroup), each processed through its own small feedforward “tower” before concatenation with transformed continuous features and input into a deep merge network. This design allows each feature group to learn intermediate representations in isolation before interacting jointly in the final layers, where higher-order relationships between features are learned. Embedding dropout was applied to high-cardinality categorical variables (school, district, and exam) to reduce overfitting, as these features are most prone to memorizing individual categories. In addition, two bilinear interaction layers explicitly modeled pairwise relationships between schools and exams, and between subgroups and exams, encoding the intuition that performance depends on specific feature interactions rather than independent effects alone. By doing this we can avoid hoping that the network will learn this interaction on its own, and instead give it directly. The merge network itself was deep and wide, consisting of five fully connected blocks that progressively reduced dimensionality from 512 units to a single output, with a final sigmoid activation scaled to match the target range [0, 100]. This architecture remained stable through initial experimentation, but further improvements via hyperparameter tuning and regularization alone proved insufficient. This motivated a reassessment of the model’s depth. In particular, the combination of a depth and the saturating sigmoid output suggested that signal propagation through the network may degrade with depth, limiting the effectiveness of early layers. To investigate this, we analyze activation variance across layers during forward passes to see how signal strength changes with depth. This gives a direct way to check whether information is preserved or gradually lost as it moves through the network.
+```{python #grad_flow}
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+class EmbedNet(nn.Module):
+    def __init__(self,
+                 n_schools,
+                 n_districts,
+                 n_distype,
+                 n_exam,
+                 n_subgroups,
+                #  n_county,
+                #  n_region,
+                 n_continuous,
+                 dropout_rate,
+                 embed_dropout_rate=0.1,
+                 school_embed_dim=16,
+                 district_embed_dim=16,
+                 distype_embed_dim=4,
+                 exam_embed_dim=8,
+                 subgroup_embed_dim=4):
+                #  county_embed_dim = 16,
+                # region_embed_dim = 4):
+
+        super().__init__()
+
+
+        # embedding layers
+        self.school_embed   = nn.Embedding(n_schools,   school_embed_dim)
+        self.district_embed = nn.Embedding(n_districts, district_embed_dim)
+        self.distype_embed  = nn.Embedding(n_distype,   distype_embed_dim)
+        self.exam_embed     = nn.Embedding(n_exam,      exam_embed_dim)
+        self.subgroup_embed = nn.Embedding(n_subgroups, subgroup_embed_dim)
+        # self.county_embed = nn.Embedding(n_county,county_embed_dim)
+        # self.region_embed = nn.Embedding(n_region,region_embed_dim)
+
+
+
+        # embedding dropout--- skipped smaller embedding sizes
+        self.school_embed_drop   = nn.Dropout(embed_dropout_rate)
+        self.district_embed_drop = nn.Dropout(embed_dropout_rate * 0.5)
+        self.exam_embed_drop     = nn.Dropout(embed_dropout_rate * 0.5)
+        #self.county_embed_drop = nn.Dropout(embed_dropout_rate * 0.5)
+
+        # school tower
+        self.school_tower = nn.Sequential(
+            nn.Linear(school_embed_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, school_embed_dim)
+        )
+
+
+        # district tower
+        self.district_tower = nn.Sequential(
+            nn.Linear(district_embed_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, district_embed_dim)
+        )
+
+
+        # district type tower
+        self.distype_tower = nn.Sequential(
+            nn.Linear(distype_embed_dim, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Linear(16, distype_embed_dim)
+        )
+
+
+        # exam tower
+        self.exam_tower = nn.Sequential(
+            nn.Linear(exam_embed_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, exam_embed_dim)
+        )
+
+        # subgroup tower
+        
+        self.subgroup_tower = nn.Sequential(
+            nn.Linear(subgroup_embed_dim, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Linear(16, subgroup_embed_dim)
+        )
+        ### COUNTY TOWER
+        # self.county_tower = nn.Sequential(
+        #     nn.Linear(county_embed_dim,32),
+        #     nn.BatchNorm1d(32),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout_rate),
+        #     nn.Linear(32,county_embed_dim)
+        # )
+        # ### REGION TOWER
+        # self.region_tower = nn.Sequential(
+        #     nn.Linear(region_embed_dim,16),
+        #     nn.BatchNorm1d(16),
+        #     nn.ReLU(),
+        #     nn.Linear(16,region_embed_dim)
+        # )
+
+
+        # bilinear interactions
+        self.school_exam_bilinear   = nn.Bilinear(school_embed_dim, exam_embed_dim, 16)
+        self.subgroup_exam_bilinear = nn.Bilinear(subgroup_embed_dim, exam_embed_dim, 8)
+
+        
+        # continuous tower
+        
+        self.continuous_tower = nn.Sequential(
+            nn.Linear(n_continuous, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, 32)
+        )
+
+        
+        # merged size
+        # school_tower(16) + district_tower(16) + distype_tower(8)
+        # + exam_tower(16) + subgroup_tower(8)
+        # + school_exam_bilinear(16) + subgroup_exam_bilinear(8)
+        # + continuous_tower(32) = 120
+        
+        merged_size = school_embed_dim + district_embed_dim + distype_embed_dim + exam_embed_dim + subgroup_embed_dim + 16 + 8 + 32
+
+        
+        # merge network
+        
+        self.merge_network = nn.Sequential(
+            nn.Linear(merged_size, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 124),
+            nn.BatchNorm1d(124),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(124, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self,
+                school_ids,
+                district_ids,
+                distype_ids,
+                exam_ids,
+                subgroup_ids,
+                # county_ids,
+                # region_ids,
+                continuous_features):
+
+        # lookups with embedding dropout
+        school_emb   = self.school_embed_drop(self.school_embed(school_ids))
+        district_emb = self.district_embed_drop(self.district_embed(district_ids))
+        distype_emb  = self.distype_embed(distype_ids)
+        exam_emb     = self.exam_embed_drop(self.exam_embed(exam_ids))
+        subgroup_emb = self.subgroup_embed(subgroup_ids)
+        # county_emb = self.county_embed(county_ids)
+        # region_emb = self.region_embed(region_ids)
+
+        # towers
+        school_out   = self.school_tower(school_emb)
+        district_out = self.district_tower(district_emb)
+        distype_out  = self.distype_tower(distype_emb)
+        exam_out     = self.exam_tower(exam_emb)
+        subgroup_out = self.subgroup_tower(subgroup_emb)
+        # county_out = self.county_tower(county_emb)
+        # region_out = self.region_tower(region_emb)
+
+        # bilinear interactions
+        school_exam_out   = self.school_exam_bilinear(school_emb, exam_emb)
+        subgroup_exam_out = self.subgroup_exam_bilinear(subgroup_emb, exam_emb)
+
+        # continuous
+        continuous_out = self.continuous_tower(continuous_features)
+
+        # concat and merge
+        merged = torch.cat([
+            school_out,
+            district_out,
+            distype_out,
+            exam_out,
+            subgroup_out,
+            school_exam_out,
+            subgroup_exam_out,
+            # county_out,
+            # region_out,
+            continuous_out
+        ], dim=1)
+
+        out = self.merge_network(merged)
+        return torch.sigmoid(out) * 100.0
+
+  # PREDICT METHOD
+    def predict(self, loader, device="cpu"):
+      self.eval()
+      all_preds = []
+
+      with torch.no_grad():
+          for school_ids, district_ids, distype_ids, exam_ids, subgroup_ids, cont_x, _ in loader:
+              school_ids   = school_ids.to(device)
+              district_ids = district_ids.to(device)
+              distype_ids  = distype_ids.to(device)
+              exam_ids     = exam_ids.to(device)
+              subgroup_ids = subgroup_ids.to(device)
+              # county_ids = county_ids.to(device)
+              # region_ids = region_ids.to(device)
+              cont_x       = cont_x.to(device)
+
+              preds = self.forward(
+                  school_ids, district_ids, distype_ids,
+                  exam_ids, subgroup_ids, cont_x
+              )
+              all_preds.append(preds.cpu())
+
+      return torch.cat(all_preds).numpy().flatten()
+
+#### GRAD FLOW FUNCTION
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import copy
+
+def activation_variance_depth_trace(
+    model,
+    loader,
+    device="mps",
+    n_batches=50,
+    title="Activation Variance Across Network Depth"
+):
+
+    model = model.to(device)
+    model.eval()
+
+    activations = {}
+    hooks = []
+    layer_order = []
+
+    
+    # identify all linear layers in forward order
+    
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            layer_order.append(name)
+            activations[name] = []
+
+    
+    # hook function
+    
+    def make_hook(name):
+        def hook(module, inp, out):
+            out = out.detach()
+
+            # variance per neuron, then average across neurons
+            var = out.var(dim=0).mean().item()
+
+            activations[name].append(var)
+
+        return hook
+
+    # register hooks
+    for name, module in model.named_modules():
+        if name in activations:
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+    
+    # run forward passes
+    
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= n_batches:
+                break
+
+            (
+                school_ids,
+                district_ids,
+                distype_ids,
+                exam_ids,
+                subgroup_ids,
+                cont_x,
+                y
+            ) = [b.to(device) for b in batch]
+
+            _ = model(
+                school_ids,
+                district_ids,
+                distype_ids,
+                exam_ids,
+                subgroup_ids,
+                cont_x
+            )
+
+    # remove hooks
+    for h in hooks:
+        h.remove()
+
+    
+    # aggregate results
+    
+    layer_means = []
+    layer_stds = []
+
+    for name in layer_order:
+        vals = np.array(activations[name])
+        layer_means.append(vals.mean())
+        layer_stds.append(vals.std())
+
+    
+    # plot
+    
+    x = np.arange(len(layer_order))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    ax.plot(x, layer_means, marker="o", label="Mean Activation Variance")
+
+    ax.fill_between(
+        x,
+        np.array(layer_means) - np.array(layer_stds),
+        np.array(layer_means) + np.array(layer_stds),
+        alpha=0.2
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(layer_order, rotation=45, ha="right")
+
+    ax.set_xlabel("Layer (Depth Order)")
+    ax.set_ylabel("Activation Variance")
+    ax.set_title(title)
+
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "layer_order": layer_order,
+        "means": layer_means,
+        "stds": layer_stds,
+        "raw": activations
+    }
+
+import random
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+ckpt = torch.load("embednet_first_network.pth", map_location="cpu")
+embed_model_1 = EmbedNet(**ckpt["config"])
+embed_model_1.load_state_dict(ckpt["model_state_dict"])
+embed_model_1.eval()
+
+# ── usage
+embednet = EmbedNet(**ckpt["config"])
+plain_vars = activation_variance_depth_trace(
+    embednet,
+    train_loader,
+    title="Plain Network Activation Variance"
+)
+
+```
+We can see that the activation variance of some of the layers is close to zero, suggesting that they are not reacting to input differences, and the representations are becoming uniform, this is especially true for the earlier layers. This motivates some more architectural changes. The first change was to remove the towers all together, and slowly add them back only when there was an improvement in loss. This showed some surprising results. Removing the towers altogether resulted a in a marginally better or similar result. We can make the assumption based on both the increased accuracy after the removal of the towers and gradient flow plot that the earlier layer were not getting enough signal. With this conclusion i decided to update the size of the embeddings moving the school embedding from size 16 to 50 and eventually to 64. This resulted in the single biggest reduction of loss in the iterations of the model. After updating all the embedding sizes I was able to get to the mid to high 50s in MSE before revisiting the towers again. Another a few trials on tweaking the towers revealed that smaller, simpler towers ended up improving performance. We can perhaps make the conclusion that the refinement taking place in the towers is actually good, but gradient problems lead to a cap on performance with the towers. This is where the idea of skip or residual connections is extremely useful. Skip connections allow for us pass the original input alongside the network transformed output. For example using the school tower as an example we have: $f_{s}(x) + x$ where x is the school embedding. After a few interactions we land on a final model that contained larger embeddings with smaller towers for each, a wider merged section, and skip connections on the school, exam, subgroup, and continuos towers. Interestingly enough the bilinear interaction layers perform better on the raw embeddings, than the tower transformed embeddings. Let's take a look at the gradient flow of this model.
+```{python #altdata}
+#| include: false
+print("CHECK SHAPES BEFORE RUNNING")
+print("X_train_alt:", X_train_alt.shape)
+print("Y_train:",     Y_train.shape)
+print("X_val_alt:",   X_val_alt.shape)
+print("Y_val:",       Y_val.shape)
+print("X_test_alt:",  X_test_alt.shape)
+print("Y_test:",      Y_test.shape)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Device: {device}")
+
+# ── embedding columns — added cat__SCHOOL_TYPE
+embed_cols_alt = [
+    "cat__SCHOOL",
+    "cat__DISTRICT",
+    "cat__ASSESSMENT_NAME",
+    "cat__SUBGROUP_NAME",
+    "cat__DISTRICT_TYPE",
+]
+
+# ── dummy columns — school_is_sparse treated as dummy not embedding
+# since it is binary (0/1) embedding would be wasteful
+cat_cols_alt = [
+    col for col in X_train_alt.columns
+    if col.startswith("cat")
+    and col not in embed_cols_alt
+]
+
+print(f"Embed cols:      {embed_cols_alt}")
+print(f"Cat dummy cols:  {cat_cols_alt}")
+
+# ── continuous features — drop embed cols, get dummies for remaining cats
+X_train_cont_alt = X_train_alt.drop(columns=embed_cols_alt).copy()
+X_val_cont_alt   = X_val_alt.drop(columns=embed_cols_alt).copy()
+X_test_cont_alt  = X_test_alt.drop(columns=embed_cols_alt).copy()
+
+print(f"\nBefore dummies train: {X_train_cont_alt.shape}")
+
+X_train_cont_alt = pd.get_dummies(X_train_cont_alt, columns=cat_cols_alt)
+X_val_cont_alt   = pd.get_dummies(X_val_cont_alt,   columns=cat_cols_alt)
+X_test_cont_alt  = pd.get_dummies(X_test_cont_alt,  columns=cat_cols_alt)
+
+print(f"After dummies train:  {X_train_cont_alt.shape}")
+
+# ── align val and test columns to train — fill missing with 0
+X_val_cont_alt  = X_val_cont_alt.reindex(
+    columns=X_train_cont_alt.columns, fill_value=0
+)
+X_test_cont_alt = X_test_cont_alt.reindex(
+    columns=X_train_cont_alt.columns, fill_value=0
+)
+
+# ── verify school_is_sparse is in continuous features
+# assert "cat__school_is_sparse" in X_train_cont_alt.columns, \
+#     "cat__school_is_sparse not found — check feature engineering"
+
+print(f"\nAligned shapes:")
+print(f"  Train: {X_train_cont_alt.shape}")
+print(f"  Val:   {X_val_cont_alt.shape}")
+print(f"  Test:  {X_test_cont_alt.shape}")
+
+print(f"\nTrain memory MB: "
+      f"{X_train_cont_alt.memory_usage(deep=True).sum() / 1024**2:.1f}")
+
+# ── ensure float32
+X_train_cont_alt = X_train_cont_alt.astype(np.float32)
+X_val_cont_alt   = X_val_cont_alt.astype(np.float32)
+X_test_cont_alt  = X_test_cont_alt.astype(np.float32)
+
+n_continuous_alt = X_train_cont_alt.shape[1]
+print(f"\nn_continuous_alt: {n_continuous_alt}")
+
+# ── encode embedding columns using train maps only
+def encode_embed_cols(cols, X_train, X_val, X_test):
+    encoded = {}
+    maps    = {}
+
+    for col in cols:
+        train_raw = X_train[col].astype(str)
+        val_raw   = X_val[col].astype(str)
+        test_raw  = X_test[col].astype(str)
+
+        unique_vals = train_raw.dropna().unique()
+        id_map      = {val: idx + 1 for idx, val in enumerate(unique_vals)}
+
+        encoded[col] = {
+            "train": train_raw.map(id_map).fillna(0).astype(int),
+            "val":   val_raw.map(id_map).fillna(0).astype(int),
+            "test":  test_raw.map(id_map).fillna(0).astype(int)
+        }
+        maps[col] = id_map
+
+    return encoded, maps
+
+encoded_alt, maps_alt = encode_embed_cols(
+    embed_cols_alt, X_train_alt, X_val_alt, X_test_alt
+)
+
+# ── embed lens — used for nn.Embedding sizes
+embed_lens_alt = {col: len(maps_alt[col]) + 1 for col in embed_cols_alt}
+
+print("\nEmbed lens:")
+for col, size in embed_lens_alt.items():
+    print(f"  {col}: {size}")
+
+# ── helper
+def enc_to_tensor(encoded_dict, split, col):
+    arr = encoded_dict[col][split].to_numpy(dtype=np.int64, copy=False)
+    return torch.from_numpy(arr)
+
+# ── embedding tensors
+school_train_t_alt    = enc_to_tensor(encoded_alt, "train", "cat__SCHOOL")
+school_val_t_alt      = enc_to_tensor(encoded_alt, "val",   "cat__SCHOOL")
+school_test_t_alt     = enc_to_tensor(encoded_alt, "test",  "cat__SCHOOL")
+
+district_train_t_alt  = enc_to_tensor(encoded_alt, "train", "cat__DISTRICT")
+district_val_t_alt    = enc_to_tensor(encoded_alt, "val",   "cat__DISTRICT")
+district_test_t_alt   = enc_to_tensor(encoded_alt, "test",  "cat__DISTRICT")
+
+dis_type_train_t_alt  = enc_to_tensor(encoded_alt, "train", "cat__DISTRICT_TYPE")
+dis_type_val_t_alt    = enc_to_tensor(encoded_alt, "val",   "cat__DISTRICT_TYPE")
+dis_type_test_t_alt   = enc_to_tensor(encoded_alt, "test",  "cat__DISTRICT_TYPE")
+
+exam_train_t_alt      = enc_to_tensor(encoded_alt, "train", "cat__ASSESSMENT_NAME")
+exam_val_t_alt        = enc_to_tensor(encoded_alt, "val",   "cat__ASSESSMENT_NAME")
+exam_test_t_alt       = enc_to_tensor(encoded_alt, "test",  "cat__ASSESSMENT_NAME")
+
+subgroup_train_t_alt  = enc_to_tensor(encoded_alt, "train", "cat__SUBGROUP_NAME")
+subgroup_val_t_alt    = enc_to_tensor(encoded_alt, "val",   "cat__SUBGROUP_NAME")
+subgroup_test_t_alt   = enc_to_tensor(encoded_alt, "test",  "cat__SUBGROUP_NAME")
+
+#school_type_train_t   = enc_to_tensor(encoded_alt, "train", "cat__SCHOOL_TYPE")
+# school_type_val_t     = enc_to_tensor(encoded_alt, "val",   "cat__SCHOOL_TYPE")
+# school_type_test_t    = enc_to_tensor(encoded_alt, "test",  "cat__SCHOOL_TYPE")
+
+# ── continuous tensors
+X_train_cont_t_alt = torch.from_numpy(
+    X_train_cont_alt.to_numpy(dtype=np.float32, copy=False)
+)
+X_val_cont_t_alt   = torch.from_numpy(
+    X_val_cont_alt.to_numpy(dtype=np.float32, copy=False)
+)
+X_test_cont_t_alt  = torch.from_numpy(
+    X_test_cont_alt.to_numpy(dtype=np.float32, copy=False)
+)
+
+# ── target tensors
+y_train_t = torch.from_numpy(
+    Y_train.to_numpy(dtype=np.float32).reshape(-1, 1)
+)
+y_val_t   = torch.from_numpy(
+    Y_val.to_numpy(dtype=np.float32).reshape(-1, 1)
+)
+y_test_t  = torch.from_numpy(
+    Y_test.to_numpy(dtype=np.float32).reshape(-1, 1)
+)
+
+# ── sanity checks
+print("\nContinuous tensors:")
+print(f"  Train: {X_train_cont_t_alt.shape} | {y_train_t.shape}")
+print(f"  Val:   {X_val_cont_t_alt.shape}   | {y_val_t.shape}")
+print(f"  Test:  {X_test_cont_t_alt.shape}  | {y_test_t.shape}")
+
+print("\nEmbedding tensors:")
+for name, t in [
+    ("school",      school_train_t_alt),
+    ("district",    district_train_t_alt),
+    ("dis_type",    dis_type_train_t_alt),
+    ("exam",        exam_train_t_alt),
+    ("subgroup",    subgroup_train_t_alt),
+    # ("school_type", school_type_train_t),
+]:
+    print(f"  {name:12s}: {t.shape} | dtype={t.dtype} | "
+          f"max={t.max().item()} < {embed_lens_alt.get('cat__' + name.upper(), '?')}")
+
+# ── TensorDatasets — 8 embedding tensors now (added school_type)
+batch_size = 2048
+print(f"\nBatch size: {batch_size} | "
+      f"Train steps per epoch: {len(Y_train) / batch_size:.0f}")
+
+train_ds_alt = TensorDataset(
+    school_train_t_alt,
+    district_train_t_alt,
+    dis_type_train_t_alt,
+    exam_train_t_alt,
+    subgroup_train_t_alt,
+    # school_type_train_t,      # new
+    X_train_cont_t_alt,
+    y_train_t
+)
+
+val_ds_alt = TensorDataset(
+    school_val_t_alt,
+    district_val_t_alt,
+    dis_type_val_t_alt,
+    exam_val_t_alt,
+    subgroup_val_t_alt,
+    # school_type_val_t,        # new
+    X_val_cont_t_alt,
+    y_val_t
+)
+
+test_ds_alt = TensorDataset(
+    school_test_t_alt,
+    district_test_t_alt,
+    dis_type_test_t_alt,
+    exam_test_t_alt,
+    subgroup_test_t_alt,
+    # school_type_test_t,       # new
+    X_test_cont_t_alt,
+    y_test_t
+)
+
+# ── DataLoaders
+train_loader_alt = DataLoader(
+    train_ds_alt,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+val_loader_alt = DataLoader(
+    val_ds_alt,
+    batch_size=batch_size,
+    shuffle=False
+)
+
+test_loader_alt = DataLoader(
+    test_ds_alt,
+    batch_size=batch_size,
+    shuffle=False
+)
+
+# print(f"\nDataLoaders ready:")
+# print(f"  train_loader_alt: {len(train_loader_alt)} batches")
+# print(f"  val_loader_alt:   {len(val_loader_alt)} batches")
+# print(f"  test_loader_alt:  {len(test_loader_alt)} batches")
+
+```
+```{python #skipnet2}
+
+class SkipEmbed_V2(nn.Module):
+    def __init__(self,
+                 n_schools,
+                 n_districts,
+                 n_distype,
+                 n_exam,
+                 n_subgroups,
+                 n_continuous,
+                 school_embed_dim=50,
+                 district_embed_dim=20,
+                 distype_embed_dim=8,
+                 exam_embed_dim=35,
+                 subgroup_embed_dim=20,
+                 school_embed_dropout=0.10,
+                 district_embed_dropout=0.05,
+                 exam_embed_dropout=0.08,
+                 cont_dropout_rate=0.35):   #from 0.15 — main change for richer features
+
+        super().__init__()
+
+        # ── embedding layers (unchanged)
+        self.school_embed   = nn.Embedding(n_schools,   school_embed_dim)
+        self.district_embed = nn.Embedding(n_districts, district_embed_dim)
+        self.distype_embed  = nn.Embedding(n_distype,   distype_embed_dim)
+        self.exam_embed     = nn.Embedding(n_exam,      exam_embed_dim)
+        self.subgroup_embed = nn.Embedding(n_subgroups, subgroup_embed_dim)
+
+        # ── school tower (unchanged)
+        self.school_tower = nn.Sequential(
+            nn.Linear(school_embed_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(32, school_embed_dim),
+        )
+        self.school_tower_skip = nn.Linear(school_embed_dim, school_embed_dim, bias=False)
+
+        # ── exam tower (unchanged)
+        self.exam_tower = nn.Sequential(
+            nn.Linear(exam_embed_dim, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(16, exam_embed_dim),
+        )
+        self.exam_tower_skip = nn.Linear(exam_embed_dim, exam_embed_dim, bias=False)
+
+        # ── subgroup tower (unchanged)
+        self.subgroup_tower = nn.Sequential(
+            nn.Linear(subgroup_embed_dim, 8),
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(8, subgroup_embed_dim),
+        )
+        self.subgroup_skip = nn.Linear(subgroup_embed_dim, subgroup_embed_dim, bias=False)
+
+        # ── embedding dropouts (unchanged)
+        self.school_embed_drop   = nn.Dropout(school_embed_dropout)
+        self.district_embed_drop = nn.Dropout(district_embed_dropout)
+        self.exam_embed_drop     = nn.Dropout(exam_embed_dropout)
+
+        # ── bilinear interactions (unchanged)
+        self.school_exam_bilinear   = nn.Bilinear(school_embed_dim,   exam_embed_dim, 16)
+        self.subgroup_exam_bilinear = nn.Bilinear(subgroup_embed_dim, exam_embed_dim, 8)
+
+        # ── continuous tower — widened and more regularized
+        self.continuous_tower = nn.Sequential(
+            nn.Linear(n_continuous, 512),           # from 128
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(cont_dropout_rate),          # from 0.25 (via cont_dropout_rate default)
+
+            nn.Linear(512, 128),                    # new intermediate layer
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(cont_dropout_rate * 0.6),    # tapered dropout
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+
+            nn.Linear(64, 32),
+        )
+
+        # ── continuous skip (unchanged)
+        self.cont_skip_proj = nn.Linear(n_continuous, 32, bias=False)
+
+        # ── merged size (unchanged formula)
+        merged_size = (school_embed_dim + district_embed_dim +
+                       distype_embed_dim + exam_embed_dim +
+                       subgroup_embed_dim +
+                       16 + 8 + 32)
+        print(f"merged_size: {merged_size}")
+
+        # ── merge block 1 (unchanged)
+        self.merge_block1 = nn.Sequential(
+            nn.Linear(merged_size, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+        )
+        self.skip_proj = nn.Linear(merged_size, 1024, bias=False)
+
+        # ── merge block 2 (unchanged)
+        self.merge_block2 = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.20),
+
+            nn.Linear(512, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, school_ids, district_ids, distype_ids, exam_ids, subgroup_ids, continuous_features):
+        school_emb   = self.school_embed_drop(self.school_embed(school_ids))
+        district_emb = self.district_embed_drop(self.district_embed(district_ids))
+        distype_emb  = self.distype_embed(distype_ids)
+        exam_emb     = self.exam_embed_drop(self.exam_embed(exam_ids))
+        subgroup_emb = self.subgroup_embed(subgroup_ids)
+
+        school_out   = self.school_tower(school_emb)   + self.school_tower_skip(school_emb)
+        exam_out     = self.exam_tower(exam_emb)       + self.exam_tower_skip(exam_emb)
+        subgroup_out = self.subgroup_tower(subgroup_emb) + self.subgroup_skip(subgroup_emb)
+
+        continuous_out = self.continuous_tower(continuous_features) + \
+                         self.cont_skip_proj(continuous_features)
+
+        school_exam_out   = self.school_exam_bilinear(school_emb, exam_emb)
+        subgroup_exam_out = self.subgroup_exam_bilinear(subgroup_emb, exam_emb)
+
+        merged = torch.cat([
+            school_out, district_emb, distype_emb,
+            exam_out, subgroup_out,
+            school_exam_out, subgroup_exam_out,
+            continuous_out,
+        ], dim=1)
+
+        block1_out = self.merge_block1(merged) + self.skip_proj(merged)
+        out = self.merge_block2(block1_out)
+        return torch.sigmoid(out) * 100.0
+
+    def predict(self, loader, device="cpu"):
+        self.eval()
+        all_preds = []
+        with torch.no_grad():
+            for school_ids, district_ids, distype_ids, exam_ids, subgroup_ids, cont_x, _ in loader:
+                school_ids   = school_ids.to(device)
+                district_ids = district_ids.to(device)
+                distype_ids  = distype_ids.to(device)
+                exam_ids     = exam_ids.to(device)
+                subgroup_ids = subgroup_ids.to(device)
+                cont_x       = cont_x.to(device)
+                preds = self.forward(school_ids, district_ids, distype_ids, exam_ids, subgroup_ids, cont_x)
+                all_preds.append(preds.cpu())
+        return torch.cat(all_preds).numpy().flatten()
+
+simple_nn = SkipEmbed_V2(
+    n_schools=embed_lens_alt["cat__SCHOOL"],
+    n_districts=embed_lens_alt["cat__DISTRICT"],
+    n_distype=embed_lens_alt["cat__DISTRICT_TYPE"],
+    n_exam=embed_lens_alt["cat__ASSESSMENT_NAME"],
+    n_subgroups=embed_lens_alt["cat__SUBGROUP_NAME"],
+    # n_county = embed_lens_alt["cat__COUNTY"],
+    # n_region = embed_lens["cat__REGION"],
+
+    school_embed_dim = 64,#from 64 to 40
+    exam_embed_dim = 30,
+    district_embed_dim = 20,# needs tuning
+    subgroup_embed_dim = 20,
+    distype_embed_dim = 10,
+    n_continuous=n_continuous_alt,
+    cont_dropout_rate=.35
+ #   embed_dropout_rate=.2
+)
+set_seed(42)
+batch = next(iter(train_loader_alt))
+         # untrained
+res_vars = activation_variance_depth_trace(
+    simple_nn,
+    train_loader_alt,
+    title="Residual Network Activation Variance"
+)
+```
+The new architecture shows a slight improvement over the previous one. We still see some variance close to zero, but there are fewer points near zero, and some key embeddings are consistently higher. We also observe an overall higher peak variance around 0.5. While this does not completely fix the issue, adding skip connections does improve how the model is learning. We can also investigate the loss landscape of the models to see if there are any differences. The plot below shows how much each model’s loss changes when the weights are slightly perturbed by noise. Models that show a large increase in loss under small perturbations indicate a sharp and sensitive loss surface. 
+
+```{python}
+#| cache: true
+
+SE_point = torch.load("skipembed1.pth", map_location="cpu")
+simple_nn.load_state_dict(SE_point["model_state_dict"])
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+sns.set_style("whitegrid")
+def loss_landscape_smoothness(
+    model,
+    loader,
+    device="mps",
+    sigmas=None,
+    n_batches=20
+):
+    model = model.to(device)
+    model.eval()
+
+    if sigmas is None:
+        sigmas = np.linspace(0.0, 0.02, 10)
+
+    loss_fn = torch.nn.MSELoss()
+
+    base_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    results = []
+
+    for sigma in sigmas:
+
+        losses = []
+
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.dtype.is_floating_point:
+                    param.add_(torch.randn_like(param) * sigma)
+
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= n_batches:
+                    break
+
+                (
+                    school_ids,
+                    district_ids,
+                    distype_ids,
+                    exam_ids,
+                    subgroup_ids,
+                    cont_x,
+                    y
+                ) = [b.to(device) for b in batch]
+
+                preds = model(
+                    school_ids,
+                    district_ids,
+                    distype_ids,
+                    exam_ids,
+                    subgroup_ids,
+                    cont_x
+                )
+
+                losses.append(loss_fn(preds, y).item())
+
+        results.append(np.mean(losses))
+        model.load_state_dict(base_state)
+
+    return sigmas, results
+
+sigmas_plain, plain_curve = loss_landscape_smoothness(
+    embed_model_1,
+    train_loader
+)
+
+sigmas_res, res_curve = loss_landscape_smoothness(
+    simple_nn,
+    train_loader_alt
+)
+
+plt.figure(figsize=(7, 5))
+
+sns.lineplot(x=sigmas_plain, y=plain_curve, marker="o", label="Plain Network")
+sns.lineplot(x=sigmas_res, y=res_curve, marker="o", label="Residual Network")
+
+plt.xlabel("Parameter noise scale (σ)")
+plt.ylabel("Loss")
+plt.title("Loss Sensitivity: Embed Net vs Skip Embed (Residual Network)")
+
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+```
+It is clear the skip connections resulted in a model that is less sensitive to change. `EmbedNet` shows huge changes in loss with slight introduced randomness, whereas the `SkipEmbed` model has a more stable result.
+
+### *Learnings from the Model*
+It is often important for a model to not only have predictive power but also allow us to understand something deeper about the data. As stated previously one way we can do this is analyze the similarity of the embedding vectors that the model learned. Let's first look at what our embeddings look like using `UMAP` with SkipEmbed trained on 95% data. Starting with school out largest categorical feature:
+
+```{python}
+#| cache: true
+#| messages: false
+#| warning: false
+import torch
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import umap
+
+full_point = torch.load("best_nn_model_full_all_data.pth", map_location="cpu")
+simple_nn.load_state_dict(full_point["model_state_dict"])
+def plot_embedding_umap_3d(
+    model,
+    embedding_layer,
+    ids,
+    y_values=None,
+    id_name="Item",
+    label_prefix="Item",
+    n_neighbors=15,
+    min_dist=0.15,
+    random_state=42,
+    title="Embedding Space (UMAP 3D)"
+):
+    model.eval()
+
+    with torch.no_grad():
+        embeddings = embedding_layer(ids).cpu().numpy()
+
+    #print(f"Embedding matrix shape: {embeddings.shape}")
+
+    reducer = umap.UMAP(
+        n_components=3,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        random_state=random_state
+    )
+
+    embedding_3d = reducer.fit_transform(embeddings)
+
+    
+    # build dataframe
+    
+    plot_df = pd.DataFrame({
+        "umap1": embedding_3d[:, 0],
+        "umap2": embedding_3d[:, 1],
+        "umap3": embedding_3d[:, 2],
+        "item": [f"{label_prefix} {i}" for i in range(len(embedding_3d))]
+    })
+
+    if y_values is not None:
+        plot_df["target"] = y_values
+
+    
+    # plot
+    
+    fig = px.scatter_3d(
+        plot_df,
+        x="umap1",
+        y="umap2",
+        z="umap3",
+        color="target" if y_values is not None else None,
+        color_continuous_scale="RdYlGn" if y_values is not None else None,
+        hover_name="item",
+        opacity=0.6,
+        title=title
+    )
+
+    fig.update_traces(marker=dict(size=3))
+    fig.show()
+
+    return embedding_3d, plot_df
+
+all_school_ids = torch.arange(embed_lens_alt["cat__SCHOOL"]).to(device)
+# align with embedding indices
+school_mean_y = (
+    pd.DataFrame({"school_id": school_train_t_alt.numpy(), "y": y_train_t.numpy().flatten()})
+    .groupby("school_id")["y"]
+    .mean()
+)
+school_ids_range = np.arange(embed_lens_alt["cat__SCHOOL"])
+mean_y_aligned   = school_ids_range_map = school_mean_y.reindex(school_ids_range).values
+embedding_3d, df = plot_embedding_umap_3d(
+    model=simple_nn,
+    embedding_layer=simple_nn.school_embed,
+    ids=all_school_ids,
+    y_values=mean_y_aligned,
+    id_name="school",
+    label_prefix="School",
+    title="School Embedding Space (UMAP 3D)"
+)
+```
+The embedding space visualized through `UMAP` is particularly interesting. We can see that the model is able to sperate the high performing schools from the low performing schools in smooth flowing structure. Theres also a particaully interesting shape of the figure where the high performant schools seperate into 2 heads. Lets look a little deeper into what this might be.
+```{python}
+import numpy as np
+import pandas as pd
+import plotly.express as px
+
+school_ids_range = np.arange(embed_lens_alt["cat__SCHOOL"])
+
+# most common district type per school, aligned to embedding index order
+distype_per_school = (
+    pd.DataFrame({"school_id": school_train_t_alt.numpy(),
+                  "distype": X_train_alt["cat__DISTRICT_TYPE"].astype(str).values})
+    .groupby("school_id")["distype"]
+    .agg(lambda s: s.mode().iloc[0])
+    .reindex(school_ids_range)
+    .astype(str)
+    .values
+)
+
+df["district_type"] = distype_per_school
+fig = px.scatter_3d(df, x="umap1", y="umap2", z="umap3",
+                    color="district_type", hover_name="item", opacity=0.6)
+fig.update_traces(marker=dict(size=3))
+fig.show()
+
+# how many schools per district type — tells you if colors will be readable
+print(pd.Series(distype_per_school).value_counts().to_string())
+```
+This above plot while quite messy, we can see that the 2 points that separate the high performant schools are mostly made up of NYC `district_type` and on the bottom mostly charter schools. This shows that the most densely packed high performers are in those 2 district types. Moving to the Exam or `ASSESSMENT_NAME` embedding. Since there are much fewer categories lets use cosine similarity .
+```{python}
+import torch
+import numpy as np
+import pandas as pd
+from numpy.linalg import norm
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.spatial.distance import squareform
+
+# all exam embedding vectors (index 0 = unknown/padding slot)
+all_exam_ids = torch.arange(embed_lens_alt["cat__ASSESSMENT_NAME"]).to(device)
+simple_nn.eval()
+with torch.no_grad():
+    exam_emb = simple_nn.exam_embed(all_exam_ids).cpu().numpy()
+
+# invert the training map: idx -> name. Index 0 is the unknown slot.
+exam_map = maps_alt["cat__ASSESSMENT_NAME"]
+idx_to_exam = {idx: name for name, idx in exam_map.items()}
+exam_name_lookup = np.array(
+    [idx_to_exam.get(i, "<UNK>") for i in range(embed_lens_alt["cat__ASSESSMENT_NAME"])]
+)
+
+# drop the index-0 unknown slot
+exam_keep = exam_name_lookup != "<UNK>"
+exam_emb_real = exam_emb[exam_keep]
+names_real = exam_name_lookup[exam_keep]
+
+# cosine similarity matrix
+unit = exam_emb_real / norm(exam_emb_real, axis=1, keepdims=True)
+cos_df = pd.DataFrame(unit @ unit.T, index=names_real, columns=names_real)
+
+# order exams by hierarchical clustering so similar ones sit adjacent
+dist = 1 - cos_df.values
+np.fill_diagonal(dist, 0)
+order = leaves_list(linkage(squareform(dist, checks=False), method="average"))
+cos_ordered = cos_df.iloc[order, order]
+
+# plot
+fig, ax = plt.subplots(figsize=(11, 9))
+im = ax.imshow(cos_ordered.values, cmap="Reds", vmin=-1, vmax=1, aspect="auto")
+ax.set_xticks(range(len(cos_ordered)))
+ax.set_yticks(range(len(cos_ordered)))
+ax.set_xticklabels(cos_ordered.columns, rotation=90, fontsize=7)
+ax.set_yticklabels(cos_ordered.index, fontsize=7)
+cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+cbar.set_label("cosine similarity", fontsize=10)
+ax.set_title("Exam Embedding Similarity (clustered)", fontsize=13, pad=12)
+plt.tight_layout()
+plt.show()
+```
+The model seems to be very good at grouping math and science exams together but its similarity in the ELA exams is somewhat weak. Possibly because the math and scince are inherintly more simular and the model is able to see this, where as the english exams have no real exam that is notebly simular. 
+```{python}
+# join to unblinded file: SCHOOL code -> SCHOOL_NAME / COUNTY_NAME
+# join to unblinded file: SCHOOL code -> SCHOOL_NAME / COUNTY_NAME
+unblind = pd.read_csv("full_data_unblinded.csv")
+
+unblind["SCHOOL"] = unblind["SCHOOL"].astype(str)
+code_to_name   = unblind.drop_duplicates("SCHOOL").set_index("SCHOOL")["SCHOOL_NAME"]
+code_to_county = unblind.drop_duplicates("SCHOOL").set_index("SCHOOL")["COUNTY_NAME"]
+
+# all school embedding vectors (index 0 = unknown/padding slot)
+all_school_ids = torch.arange(embed_lens_alt["cat__SCHOOL"]).to(device)
+simple_nn.eval()
+with torch.no_grad():
+    school_emb = simple_nn.school_embed(all_school_ids).cpu().numpy()
+
+# invert the training map: idx -> SCHOOL code. Index 0 is the unknown slot.
+school_map = maps_alt["cat__SCHOOL"]
+idx_to_school = {idx: code for code, idx in school_map.items()}
+school_code_lookup = np.array(
+    [idx_to_school.get(i, "<UNK>") for i in range(embed_lens_alt["cat__SCHOOL"])]
+)
+
+school_name_lookup   = pd.Series(school_code_lookup).map(code_to_name).fillna("Unknown").to_numpy()
+school_county_lookup = pd.Series(school_code_lookup).map(code_to_county).fillna("Unknown").to_numpy()
+
+# ── school-specific mask: drop the index-0 unknown slot
+school_real = school_code_lookup != "<UNK>"
+
+school_emb_real = school_emb[school_real]
+name_real       = school_name_lookup[school_real]
+county_real     = school_county_lookup[school_real]
+
+unit = school_emb_real / norm(school_emb_real, axis=1, keepdims=True)
+avg_prof_real = mean_y_aligned[school_real]
+
+def nearest_schools(query_name, k=10):
+    matches = np.where(name_real == query_name)[0]
+    if len(matches) == 0:
+        hits = [n for n in np.unique(name_real) if query_name.lower() in str(n).lower()]
+        print(f"'{query_name}' not found. Try: {hits[:5]}")
+        return None
+    idx = matches[0]
+    sims = unit @ unit[idx]
+    order = np.argsort(-sims)
+    order = order[order != idx][:k]
+    return pd.DataFrame({
+        "school":          name_real[order],
+        "county":          county_real[order],
+        "cosine_sim":      sims[order].round(3),
+        "avg_proficiency": np.round(avg_prof_real[order], 1),
+    }).reset_index(drop=True)
+
+print(nearest_schools("HICKSVILLE HIGH SCHOOL", k=10))
+
+```
+#### *Struggles, pitfalls and Possible Improvements*
+
+The most persistent technical failure was capturing the endpoints of the distribution. Despite building specialized models aimed directly at this problem — asymmetric-loss boosters that penalized under-prediction to chase the upper spike, and the mirror version for the lower spike — and ensembling them alongside the general models, the final predictions still smoothed toward the middle of the range. The specialists shifted predictions in the right direction but never committed to exact 0 or 100 values, and the stacker, by averaging across base models, pulled even the confident extremes back toward the interior. In hindsight this is an inherent tension: a model trained to minimize squared error has no incentive to output an exact boundary value, because the conditional mean of a noisy, bounded target almost never sits precisely at the edge. No amount of ensembling resolved this, because every base model shared the same underlying disincentive.
+
+A second, more process-oriented weakness was how I allocated my time. Early on, I invested heavily in tuning LightGBM's hyperparameters close to exhaustion, sweeping learning rates, leaf counts, regularization, and sampling fractions in pursuit of marginal gains. The returns on this effort were small; once the model was reasonably configured, further tuning moved the validation error by fractions of a point. The lesson, which I would apply differently next time, is that breadth beats depth in the early and middle stages of a competition. Time spent exhausting one model's hyperparameter space would have been better spent trialing genuinely different approaches, the diversity of model types contributed far more to the final ensemble than the fine-tuning of any single one. For example, I discovered using the embeddings from the neural net to replace the respective columns in the dataset, and then training tree based models on that data resulted in a much stronger tree model. This concept opened up a wide range of models since it eliminated the high cardinal variables from vectors, but was implemented to late in the game. 
+
+Another issue I faced throughout the modeling process was a persistent train–test gap. This was not typical overfitting: no amount of regularization closed it. When training error fell, test error fell in step, but the gap between them held nearly constant at around 30 MSE. What explains a gap that moves in parallel with training error rather than widening as the model fits? It could be irreducible noise concentrated in the test set. A secondary possibility is that the train–test split left some embedding categories sparse: with fewer training rows per school, the learned embeddings are noisier, and schools appearing rarely (or only) in the test split cannot be represented well. This is something that I still need to understand.
+
+The most important lesson, however, came from a structural property of the data discovered after the fact. The target is not a set of independent observations: subgroup proficiency rates and their student counts satisfy an exact, count-weighted identity with their parent group. Recognizing this allowed a large fraction of the predictions to be solved algebraically, rather than estimated by any model. Applied as a post-competition submission, this single insight reduced the error to roughly 25 MSE, well below anything the modeling alone achieved. The gap between what the models produced and what the algebra recovered is the clearest possible evidence that the largest gains in this problem came not from model sophistication but from understanding how the data was generated. Had I investigated the relational structure of the target earlier, I would have reached this result during the competition rather than after it.
+

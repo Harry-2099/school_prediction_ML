@@ -1,0 +1,32 @@
+project:
+  type: website
+  output-dir: docs          # GitHub Pages serves from /docs on main
+
+website:
+  title: "Harry Sohal"
+  description: "Data science & machine learning projects"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: projects.qmd
+        text: Projects
+    right:
+      - icon: github
+        href: https://github.com/YOURUSERNAME       # <-- edit
+        aria-label: GitHub
+  page-footer:
+    center: "© 2026 Harry Sohal"
+
+format:
+  html:
+    theme: cosmo            # try: flatly, litera, lux, zephyr, darkly
+    css: styles.css
+    toc: true
+    toc-location: right
+    code-fold: true         # collapses code blocks by default (matches your report)
+    code-tools: true        # adds a show/hide-all-code button
+    embed-resources: false  # website mode handles assets; keep false for multi-page
+    smooth-scroll: true
+    grid:
+      body-width: 900px
