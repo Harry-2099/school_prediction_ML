@@ -9,11 +9,11 @@ website:
     left:
       - href: index.qmd
         text: Home
-      - href: projects.qmd
+      - href: Stat_learning_final_paper.qmd
         text: Projects
     right:
       - icon: github
-        href: https://github.com/YOURUSERNAME       # <-- edit
+        href: https://github.com/Harry-2099
         aria-label: GitHub
   page-footer:
     center: "© 2026 Harry Sohal"
